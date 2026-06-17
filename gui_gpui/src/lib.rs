@@ -4,7 +4,6 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::{Arc, Mutex};
 
 use gpui::*;
-use serde_json::Value;
 
 mod widgets;
 use widgets::{h_flex, v_flex};
@@ -26,8 +25,6 @@ mod palette {
     pub fn accent_hover() -> Rgba { Rgba { r: 0.49, g: 0.48, b: 0.98, a: 1.0 } }
     pub fn accent_dim() -> Rgba { Rgba { r: 0.90, g: 0.89, b: 0.99, a: 1.0 } }
     pub fn green() -> Rgba { Rgba { r: 0.13, g: 0.77, b: 0.37, a: 1.0 } }
-    pub fn orange() -> Rgba { Rgba { r: 0.96, g: 0.62, b: 0.04, a: 1.0 } }
-    pub fn pink() -> Rgba { Rgba { r: 0.94, g: 0.38, b: 0.62, a: 1.0 } }
     pub fn cyan() -> Rgba { Rgba { r: 0.04, g: 0.69, b: 0.81, a: 1.0 } }
 }
 
@@ -35,21 +32,31 @@ fn font_stack() -> SharedString {
     SharedString::from("Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif")
 }
 
-// ── Message ──────────────────────────────────────────────────
+// ── Page item ─────────────────────────────────────────────────
 
-#[derive(Clone)]
-struct MessageRow {
-    role: String,
-    text: String,
-    is_design: bool,
+#[derive(Clone, Debug)]
+struct PageItem {
+    name: String,
+    selected: bool,
+    done: bool,
 }
 
-// ── GuiApp ────────────────────────────────────────────────────
+// ── App stage ─────────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq)]
+enum AppStage {
+    Input,
+    Splitting,
+    Confirm,
+    Generating,
+}
+
+// ── GuiApp (thread-safe shared state) ─────────────────────────
 
 pub struct GuiApp {
     on_user_message: Option<extern "C" fn(*const c_char, *const c_char, *mut c_void)>,
     user_data: *mut c_void,
-    messages: Arc<Mutex<Vec<MessageRow>>>,
+    pages: Arc<Mutex<Vec<PageItem>>>,
     lua_state: *mut c_void,
 }
 
@@ -59,17 +66,11 @@ unsafe impl Sync for GuiApp {}
 // ── C ABI ─────────────────────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn gui_app_create(config_json: *const c_char) -> *mut c_void {
-    if config_json.is_null() { return std::ptr::null_mut(); }
-    let config_str = unsafe { CStr::from_ptr(config_json).to_string_lossy() };
-    let _ = match serde_json::from_str::<Value>(&config_str) {
-        Ok(Value::Object(m)) => m,
-        _ => serde_json::Map::new(),
-    };
+pub extern "C" fn gui_app_create(_config_json: *const c_char) -> *mut c_void {
     let app = GuiApp {
         on_user_message: None,
         user_data: std::ptr::null_mut(),
-        messages: Arc::new(Mutex::new(Vec::new())),
+        pages: Arc::new(Mutex::new(Vec::new())),
         lua_state: std::ptr::null_mut(),
     };
     Box::into_raw(Box::new(app)) as *mut c_void
@@ -90,26 +91,30 @@ pub extern "C" fn gui_on_user_message(
     app.user_data = userdata;
 }
 
+/// Lua calls this to set the page list after AI splitting
 #[no_mangle]
-pub extern "C" fn gui_stream_delta(app: *mut c_void, _session_id: *const c_char, delta: *const c_char) {
-    if app.is_null() || delta.is_null() { return; }
-    let delta_str = unsafe { CStr::from_ptr(delta).to_string_lossy().to_string() };
-    let app: &GuiApp = unsafe { &*(app as *mut GuiApp) };
-    let mut msgs = app.messages.lock().unwrap();
-    if let Some(last) = msgs.last_mut() {
-        if last.role == "assistant" { last.text.push_str(&delta_str); return; }
+pub extern "C" fn gui_set_pages(app: *mut c_void, pages_json: *const c_char) {
+    if app.is_null() || pages_json.is_null() { return; }
+    let json_str = unsafe { CStr::from_ptr(pages_json).to_string_lossy() };
+    if let Ok(pages) = serde_json::from_str::<Vec<String>>(&json_str) {
+        let app: &GuiApp = unsafe { &*(app as *mut GuiApp) };
+        let mut list = app.pages.lock().unwrap();
+        list.clear();
+        for name in pages {
+            list.push(PageItem { name, selected: true, done: false });
+        }
     }
-    msgs.push(MessageRow { role: "assistant".to_string(), text: delta_str, is_design: false });
 }
 
+/// Lua calls this to mark a page as done
 #[no_mangle]
-pub extern "C" fn gui_append_message(app: *mut c_void, _session_id: *const c_char, role: *const c_char, text: *const c_char) {
-    if app.is_null() || role.is_null() || text.is_null() { return; }
-    let role_str = unsafe { CStr::from_ptr(role).to_string_lossy().to_string() };
-    let text_str = unsafe { CStr::from_ptr(text).to_string_lossy().to_string() };
-    let is_design = role_str == "design";
+pub extern "C" fn gui_set_page_done(app: *mut c_void, index: c_int) {
+    if app.is_null() { return; }
     let app: &GuiApp = unsafe { &*(app as *mut GuiApp) };
-    app.messages.lock().unwrap().push(MessageRow { role: role_str, text: text_str, is_design });
+    let mut list = app.pages.lock().unwrap();
+    if index >= 0 && (index as usize) < list.len() {
+        list[index as usize].done = true;
+    }
 }
 
 #[no_mangle]
@@ -140,6 +145,7 @@ pub extern "C" fn gui_run(app_ptr: *mut c_void, lua_state: *mut c_void) -> c_int
                 cx.new(|_| DesignView {
                     app: app_ptr,
                     input_text: String::new(),
+                    stage: AppStage::Input,
                 })
             },
         ).ok();
@@ -152,21 +158,12 @@ pub extern "C" fn gui_run(app_ptr: *mut c_void, lua_state: *mut c_void) -> c_int
 struct DesignView {
     app: *mut GuiApp,
     input_text: String,
+    stage: AppStage,
 }
 
-const SKILLS: &[(&str, &str, &str, &str)] = &[
-    ("web-landing",  "🌐 Web Landing" , "Web Landing", "web"),
-    ("mobile-ios",   "📱 iOS App"     , "iOS App", "mobile"),
-    ("mobile-md",    "🟣 Material"    , "Material", "mobile"),
-    ("dashboard",    "📊 Dashboard"   , "Dashboard", "web"),
-    ("ecommerce",    "🛍️ E-Commerce" , "E-Commerce", "web"),
-    ("settings",     "⚙️ Settings"    , "Settings", "mobile"),
-];
-
 impl DesignView {
-    fn send_message(&mut self, cx: &mut Context<Self>) {
-        let text = self.input_text.trim().to_string();
-        if text.is_empty() { return; }
+    fn send_to_lua(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.trim().is_empty() { return; }
         let app = self.app;
         {
             let app_ref: &mut GuiApp = unsafe { &mut *app };
@@ -176,39 +173,38 @@ impl DesignView {
                 cb(s.as_ptr(), t.as_ptr(), app_ref.user_data);
             }
         }
-        self.input_text.clear();
         cx.notify();
     }
 
     fn handle_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        // Use key_char for composed characters, otherwise fall back to keystroke.key
         let key_str = event.keystroke.key_char.as_ref()
             .unwrap_or(&event.keystroke.key);
-
         match key_str.as_str() {
-            "backspace" | "delete" => {
-                self.input_text.pop();
-                cx.notify();
-            }
+            "backspace" | "delete" => { self.input_text.pop(); cx.notify(); }
             "enter" | "return" => {
-                if !event.keystroke.modifiers.shift {
-                    self.send_message(cx);
-                } else {
-                    self.input_text.push('\n');
-                    cx.notify();
+                if self.stage == AppStage::Input && !self.input_text.trim().is_empty() {
+                    self.start_split(cx);
                 }
             }
-            "space" => {
-                self.input_text.push(' ');
-                cx.notify();
-            }
-            // Skip control keys
-            s if s.len() == 1 => {
-                self.input_text.push_str(s);
-                cx.notify();
-            }
+            "space" => { self.input_text.push(' '); cx.notify(); }
+            s if s.len() == 1 => { self.input_text.push_str(s); cx.notify(); }
             _ => {}
         }
+    }
+
+    fn start_split(&mut self, cx: &mut Context<Self>) {
+        let req = self.input_text.trim().to_string();
+        if req.is_empty() { return; }
+        self.stage = AppStage::Splitting;
+        self.send_to_lua(&format!("/split {}", req), cx);
+    }
+
+    fn start_generate(&mut self, cx: &mut Context<Self>) {
+        self.stage = AppStage::Generating;
+        // Collect selected page names
+        let pages = unsafe { &*self.app }.pages.lock().unwrap().clone();
+        let names: Vec<String> = pages.iter().filter(|p| p.selected).map(|p| p.name.clone()).collect();
+        self.send_to_lua(&format!("/generate {}", serde_json::to_string(&names).unwrap_or_default()), cx);
     }
 }
 
@@ -222,151 +218,225 @@ impl Render for DesignView {
         let text_sec = palette::text_secondary();
         let accent = palette::accent();
 
-        let messages = unsafe { &*self.app }.messages.lock().unwrap().clone();
-        let input_display = if self.input_text.is_empty() {
-            SharedString::from("Describe the UI you want to create...")
-        } else {
-            SharedString::from(self.input_text.as_str())
-        };
-        let input_color = if self.input_text.is_empty() { text_sec } else { text_pri };
-
-        // ── Left panel ──
+        // ═══ LEFT PANEL ═══
         let left_panel = v_flex()
             .w(px(220.0)).h_full().bg(surface).border_r_1().border_color(border)
-            .child(
-                h_flex().px_4().py(px(16.0)).gap_2()
-                    .child(div().w(px(28.0)).h(px(28.0)).rounded_lg().bg(accent)
-                        .flex().items_center().justify_center()
-                        .child(div().child("M").text_color(gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })
-                            .font_weight(FontWeight::BOLD).text_base().font_family(font_stack())))
-                    .child(div().child("my_design").text_color(text_pri).text_base().font_weight(FontWeight::SEMIBOLD).font_family(font_stack())))
-            .child(v_flex().flex_1().px_3()
-                .child(div().px_1().py(px(8.0)).text_xs().font_weight(FontWeight::BOLD).text_color(text_sec).font_family(font_stack())
-                    .child("STYLES".to_uppercase()))
-                .children(SKILLS.iter().enumerate().map(|(i, (_id, name, icon, _cat))| {
-                    let is_first = i == 0;
-                    div().px_3().py(px(8.0)).rounded_md()
-                        .bg(if is_first { palette::accent_dim() } else { gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } })
-                        .hover(|s| s.bg(if is_first { palette::accent_dim() } else { palette::bg_elevated() }))
-                        .cursor_pointer()
-                        .child(h_flex().gap_3().items_center()
-                            .child(div().child(icon.to_string()).text_base())
-                            .child(div().child(name.to_string()).text_color(text_pri).text_sm().font_family(font_stack())))
-                })))
+            .child(h_flex().px_4().py(px(16.0)).gap_2()
+                .child(div().w(px(28.0)).h(px(28.0)).rounded_lg().bg(accent)
+                    .flex().items_center().justify_center()
+                    .child(div().child("M").text_color(gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })
+                        .font_weight(FontWeight::BOLD).text_base().font_family(font_stack())))
+                .child(div().child("my_design").text_color(text_pri).text_base().font_weight(FontWeight::SEMIBOLD).font_family(font_stack())))
+            .child(v_flex().flex_1().px_3().py(px(12.0))
+                .child(section_title("PROJECT"))
+                .child(div().px_2().py(px(8.0)).rounded_md().bg(card)
+                    .child(div().child("New Project").text_color(text_pri).text_sm().font_family(font_stack()))
+                    .cursor_pointer().on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _w, cx| {
+                        this.input_text.clear();
+                        this.stage = AppStage::Input;
+                        unsafe { &*this.app }.pages.lock().unwrap().clear();
+                        cx.notify();
+                    }))))
             .child(div().px_4().py(px(12.0)).border_t_1().border_color(border)
-                .child(div().child("AI UI Designer v0.1").text_color(text_sec).text_xs().font_family(font_stack())));
+                .child(div().child("v0.2 · Page Split Workflow").text_color(text_sec).text_xs().font_family(font_stack())));
 
-        // ── Canvas area ──
-        let canvas = v_flex().flex_1().h_full().bg(bg).overflow_hidden()
-            .child(v_flex().flex_1().px_6().py(px(16.0)).gap_4()
-                .children(if messages.is_empty() {
-                    vec![v_flex().flex_1().items_center().justify_center().gap_4()
-                        .child(div().w(px(80.0)).h(px(80.0)).rounded_2xl()
-                            .bg(gpui::Rgba { r: 0.39, g: 0.38, b: 0.95, a: 0.15 })
-                            .flex().items_center().justify_center()
-                            .child(div().child("✨").text_2xl()))
-                        .child(div().child("What would you like to design today?")
-                            .text_color(text_pri).text_xl().font_weight(FontWeight::SEMIBOLD).font_family(font_stack()))
-                        .child(div().child("Type your idea below and click Generate — AI will create a draft based on the selected style. You can then refine it.")
-                            .text_color(text_sec).text_base().font_family(font_stack()))
-                        .into_any_element()]
-                } else {
-                    messages.iter().enumerate().map(|(idx, m)| {
-                        let (label, ac) = match m.role.as_str() {
-                            "user" => ("You", palette::cyan()),
-                            "assistant" => ("AI", palette::accent()),
-                            "design" => ("💎 Design", palette::pink()),
-                            _ => ("System", palette::text_muted()),
-                        };
-                        let msg_bg = if idx % 2 == 0 { card } else { gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } };
+        // ═══ MAIN AREA ═══
+        let pages = unsafe { &*self.app }.pages.lock().unwrap().clone();
 
-                        v_flex().bg(msg_bg).rounded_lg().p_4().gap_2()
-                            .child(h_flex().gap_2().items_center()
-                                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(ac))
-                                .child(div().child(label).text_color(ac).text_sm().font_weight(FontWeight::SEMIBOLD).font_family(font_stack())))
-                            .child(if m.is_design {
-                                // Design preview card
-                                v_flex().gap_2()
-                                    .child(div().child(m.text.clone()).text_color(text_pri).text_base().font_family(font_stack()))
-                                    .child(
-                                        div().px_4().py(px(24.0)).rounded_lg()
-                                            .bg(gpui::Rgba { r: 0.39, g: 0.38, b: 0.95, a: 0.06 })
-                                            .border_1().border_color(palette::accent_dim())
-                                            .flex().items_center().justify_center()
-                                            .child(h_flex().gap_3().items_center()
-                                                .child(div().child("🖼").text_lg())
-                                                .child(div().child("Design Preview").text_color(text_sec).text_sm().font_family(font_stack())))
-                                    )
+        let main_area = v_flex().flex_1().h_full().bg(bg)
+            .child(v_flex().flex_1().px_6().py(px(20.0)).gap_4()
+                .children(match self.stage {
+                    AppStage::Input => {
+                        vec![v_flex().flex_1().items_center().justify_center().gap_4()
+                            .child(div().w(px(80.0)).h(px(80.0)).rounded_2xl()
+                                .bg(gpui::Rgba { r: 0.39, g: 0.38, b: 0.95, a: 0.15 })
+                                .flex().items_center().justify_center()
+                                .child(div().child("🚀").text_2xl()))
+                            .child(div().child("What are you building?")
+                                .text_color(text_pri).text_xl().font_weight(FontWeight::SEMIBOLD).font_family(font_stack()))
+                            .child(div().child("Describe your project — I'll split it into pages for you.")
+                                .text_color(text_sec).text_base().font_family(font_stack()))
+                            .into_any_element()]
+                    }
+                    AppStage::Splitting => {
+                        vec![v_flex().flex_1().items_center().justify_center().gap_3()
+                            .child(div().child("🔍").text_2xl())
+                            .child(div().child("Analyzing your requirements...")
+                                .text_color(text_pri).text_base().font_family(font_stack()))
+                            .child(div().child("AI is figuring out what pages you need.")
+                                .text_color(text_sec).text_sm().font_family(font_stack()))
+                            .into_any_element()]
+                    }
+                    AppStage::Confirm => {
+                        let all_selected = pages.iter().all(|p| p.selected);
+                        let mut items: Vec<AnyElement> = Vec::new();
+                        // Header
+                        items.push(
+                            v_flex().gap_2()
+                                .child(h_flex().gap_3().items_center()
+                                    .child(div().child("📋").text_lg())
+                                    .child(div().child("Suggested Pages").text_color(text_pri).text_lg().font_weight(FontWeight::SEMIBOLD).font_family(font_stack()))
+                                    .child(div().child(format!("({})", pages.len())).text_color(text_sec).text_sm().font_family(font_stack())))
+                                .child(div().child("Select the pages you want to generate. All pages will share the same style.")
+                                    .text_color(text_sec).text_sm().font_family(font_stack()))
+                                .into_any_element()
+                        );
+                        // Select all toggle
+                        items.push(
+                            h_flex().gap_2().items_center().cursor_pointer()
+                                .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, _, _w, cx| {
+                                    let mut list = unsafe { &*this.app }.pages.lock().unwrap();
+                                    let new_val = !all_selected;
+                                    for p in list.iter_mut() { p.selected = new_val; }
+                                    cx.notify();
+                                }))
+                                .child(div().w(px(18.0)).h(px(18.0)).rounded_md()
+                                    .bg(if all_selected { accent } else { gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } })
+                                    .border_1().border_color(if all_selected { accent } else { border }))
+                                .child(div().child(if all_selected { "Deselect all" } else { "Select all" })
+                                    .text_color(text_sec).text_sm().font_family(font_stack()))
+                                .into_any_element()
+                        );
+                        // Page list
+                        for (i, p) in pages.iter().enumerate() {
+                            let page_names = vec!["🛒 ", "📄 ", "🛵 ", "💳 ", "👤 ", "📦 ", "⚙️ ", "🏠 "];
+                            let icon = page_names.get(i).unwrap_or(&"📄 ");
+                            let idx = i;
+                            let selected = p.selected;
+                            items.push(
+                                h_flex().px_4().py(px(10.0)).rounded_lg()
+                                    .bg(if selected { card } else { gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } })
+                                    .hover(|s| s.bg(card))
+                                    .cursor_pointer().gap_3().items_center()
+                                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |this, _, _w, cx| {
+                                        let mut list = unsafe { &*this.app }.pages.lock().unwrap();
+                                        if idx < list.len() { list[idx].selected = !list[idx].selected; }
+                                        cx.notify();
+                                    }))
+                                    .child(div().w(px(18.0)).h(px(18.0)).rounded_md()
+                                        .bg(if selected { accent } else { gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } })
+                                        .border_1().border_color(if selected { accent } else { border })
+                                        .flex().items_center().justify_center()
+                                        .child(if selected { div().child("✓").text_color(gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }).text_xs() } else { div() }))
+                                    .child(div().child(*icon).text_base())
+                                    .child(div().child(p.name.clone()).text_color(text_pri).text_sm().font_family(font_stack()).flex_1())
                                     .into_any_element()
-                            } else {
-                                div().child(m.text.clone()).text_color(text_pri).text_base().font_family(font_stack())
+                            );
+                        }
+                        // Generate button
+                        let has_selected = pages.iter().any(|p| p.selected);
+                        items.push(
+                            h_flex().gap_3().pt_4()
+                                .child(
+                                    div().px_6().py(px(12.0)).rounded_xl()
+                                        .bg(if has_selected { accent } else { palette::bg_elevated() })
+                                        .hover(|s| if has_selected { s.bg(palette::accent_hover()) } else { s })
+                                        .cursor_pointer()
+                                        .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _w, cx| {
+                                            if unsafe { &*this.app }.pages.lock().unwrap().iter().any(|p| p.selected) {
+                                                this.start_generate(cx);
+                                            }
+                                        }))
+                                        .child(h_flex().gap_2().items_center()
+                                            .child(div().child("✨").text_sm())
+                                            .child(div().child(format!("Generate {} pages", pages.iter().filter(|p| p.selected).count()))
+                                                .text_color(gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }).text_sm().font_weight(FontWeight::SEMIBOLD).font_family(font_stack())))
+                                )
+                                .into_any_element()
+                        );
+                        items
+                    }
+                    AppStage::Generating => {
+                        let done_count = pages.iter().filter(|p| p.done).count();
+                        let total = pages.len();
+                        let mut items: Vec<AnyElement> = Vec::new();
+                        items.push(
+                            v_flex().gap_1()
+                                .child(h_flex().gap_3().items_center()
+                                    .child(div().child("🎨").text_lg())
+                                    .child(div().child("Generating Designs").text_color(text_pri).text_lg().font_weight(FontWeight::SEMIBOLD).font_family(font_stack())))
+                                .child(div().child(format!("{}/{} pages completed", done_count, total))
+                                    .text_color(text_sec).text_sm().font_family(font_stack()))
+                                .into_any_element()
+                        );
+                        for (i, p) in pages.iter().enumerate() {
+                            let icons = vec!["🛒", "📄", "🛵", "💳", "👤", "📦", "⚙️", "🏠"];
+                            let icon = icons.get(i).unwrap_or(&"📄");
+                            let status_icon = if p.done { "✅" } else { "⏳" };
+                            let bg_c = if p.done { gpui::Rgba { r: 0.13, g: 0.77, b: 0.37, a: 0.08 } } else { card };
+                            items.push(
+                                h_flex().px_4().py(px(10.0)).rounded_lg().bg(bg_c).gap_3().items_center()
+                                    .child(div().child(status_icon).text_sm())
+                                    .child(div().child(*icon).text_base())
+                                    .child(div().child(p.name.clone()).text_color(text_pri).text_sm().font_family(font_stack()).flex_1())
+                                    .child(if p.done { div().child("Done").text_color(palette::green()).text_xs().font_family(font_stack()) } else { div().child("Generating...").text_color(text_sec).text_xs().font_family(font_stack()) })
                                     .into_any_element()
-                            })
-                            .into_any_element()
-                    }).collect()
-                }))
-            // ── Input bar ──
-            .child(v_flex().px_6().py(px(16.0)).border_t_1().border_color(border).bg(surface).gap_3()
-                .child(h_flex().gap_2()
-                    .child(chip("Web", true, accent))
-                    .child(chip("Mobile", false, palette::bg_elevated()))
-                    .child(chip("Dashboard", false, palette::bg_elevated())))
+                            );
+                        }
+                        items
+                    }
+                }));
+
+        // ═══ INPUT BAR (visible only in Input stage) ═══
+        let input_bar = if self.stage == AppStage::Input {
+            let input_display = if self.input_text.is_empty() {
+                SharedString::from("e.g. Design a food delivery app...")
+            } else {
+                SharedString::from(self.input_text.as_str())
+            };
+            let input_color = if self.input_text.is_empty() { text_sec } else { text_pri };
+            let can_split = !self.input_text.trim().is_empty();
+
+            v_flex().px_6().py(px(16.0)).border_t_1().border_color(border).bg(surface).gap_3()
                 .child(h_flex().gap_3()
-                    .child(
-                        // ═══ KEYBOARD INPUT ═══
-                        div().flex_1()
-                            .id("prompt-input")
-                            .px_4().py(px(12.0)).rounded_xl()
-                            .bg(palette::bg_card()).border_1().border_color(border)
-                            .cursor_text()
-                            .child(div().child(input_display.to_string()).text_color(input_color).text_base().font_family(font_stack()))
-                            .on_key_down(cx.listener(|this, event, _window, _cx| {
-                                this.handle_key(event, _cx);
-                            }))
-                            .on_mouse_down(gpui::MouseButton::Left, |_event, _window, _cx| {
-                                // Click handled, focus is automatic with .id()
-                            })
-                    )
-                    .child(
-                        // ═══ GENERATE BUTTON ═══
-                        div().px_5().py(px(12.0)).rounded_xl().bg(accent)
-                            .hover(|s| s.bg(palette::accent_hover()))
-                            .cursor_pointer()
-                            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _event, _window, cx| {
-                                this.send_message(cx);
-                            }))
-                            .child(h_flex().gap_2().items_center()
-                                .child(div().child("✨").text_sm())
-                                .child(div().child("Generate").text_color(gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 })
-                                    .text_sm().font_weight(FontWeight::SEMIBOLD).font_family(font_stack())))
-                    )));
+                    .child(div().flex_1().id("prompt-input")
+                        .px_4().py(px(12.0)).rounded_xl()
+                        .bg(palette::bg_card()).border_1().border_color(border).cursor_text()
+                        .child(div().child(input_display.to_string()).text_color(input_color).text_base().font_family(font_stack()))
+                        .on_key_down(cx.listener(|this, event, _w, cx| { this.handle_key(event, cx); }))
+                        .on_mouse_down(gpui::MouseButton::Left, |_e, _w, _cx| {}))
+                    .child(div().px_5().py(px(12.0)).rounded_xl()
+                        .bg(if can_split { accent } else { palette::bg_elevated() })
+                        .hover(|s| if can_split { s.bg(palette::accent_hover()) } else { s })
+                        .cursor_pointer()
+                        .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _w, cx| {
+                            if !this.input_text.trim().is_empty() { this.start_split(cx); }
+                        }))
+                        .child(h_flex().gap_2().items_center()
+                            .child(div().child("🔍").text_sm())
+                            .child(div().child("Split Requirements")
+                                .text_color(gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }).text_sm().font_weight(FontWeight::SEMIBOLD).font_family(font_stack()))))
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
 
-        // ── Right panel ──
+        // ═══ RIGHT PANEL ═══
         let right_panel = v_flex().w(px(260.0)).h_full().bg(surface).border_l_1().border_color(border)
             .child(v_flex().px_4().py(px(16.0)).gap_4()
                 .child(v_flex().gap_3()
-                    .child(section_title("DESIGN TOKENS"))
-                    .child(token_row("Primary",   "#6366f1", palette::accent()))
-                    .child(token_row("Secondary", "#8b5cf6", palette::accent_hover()))
-                    .child(token_row("Background","#ffffff", gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }))
-                    .child(token_row("Text",      "#1e1e1e", gpui::Rgba { r: 0.12, g: 0.12, b: 0.12, a: 1.0 }))
-                    .child(token_row("Radius",    "12px",    gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 })))
+                    .child(section_title("SKILL"))
+                    .child(skill_select("Shadcn/ui", true, accent))
+                    .child(skill_select("Material 3", false, palette::bg_elevated()))
+                    .child(skill_select("iOS HIG", false, palette::bg_elevated()))
+                    .child(skill_select("Ant Design", false, palette::bg_elevated())))
                 .child(divider(border))
                 .child(v_flex().gap_3()
                     .child(section_title("EXPORT"))
-                    .child(export_btn("React Component", palette::cyan()))
-                    .child(export_btn("HTML + CSS",     palette::green()))
-                    .child(export_btn("Figma (JSON)",   palette::orange())))
+                    .child(export_btn("React", palette::cyan()))
+                    .child(export_btn("HTML + CSS", palette::green()))
+                    .child(export_btn("Figma", palette::accent())))
                 .child(divider(border))
                 .child(v_flex().gap_2()
-                    .child(section_title("RECENT"))
-                    .child(history_item("Landing page v3", "2 min ago", palette::accent()))
-                    .child(history_item("Login screen", "15 min ago", palette::cyan()))
-                    .child(history_item("Dashboard", "1 hour ago", palette::green()))));
+                    .child(section_title("PROJECTS"))
+                    .child(history_item("Food Delivery App", "just now", palette::accent()))));
 
         h_flex().size_full().bg(bg)
             .child(left_panel)
-            .child(canvas)
+            .child(v_flex().flex_1()
+                .child(main_area)
+                .child(input_bar))
             .child(right_panel)
     }
 }
@@ -378,57 +448,36 @@ fn section_title(text: &str) -> impl IntoElement {
         .text_color(palette::text_secondary()).font_family(font_stack())
 }
 
-fn chip(text: &str, active: bool, _bg: Rgba) -> impl IntoElement {
-    let t = SharedString::from(text);
-    let bg = if active { palette::accent() } else { palette::bg_elevated() };
-    let tc = if active { gpui::Rgba { r: 1.0, g: 1.0, b: 1.0, a: 1.0 } } else { palette::text_secondary() };
-    div().px_3().py(px(4.0)).rounded_full().bg(bg)
-        .child(div().child(t).text_color(tc).text_xs().font_weight(FontWeight::MEDIUM).font_family(font_stack()))
-}
-
 fn divider(border: Rgba) -> impl IntoElement {
     div().h(px(1.0)).w_full().bg(border)
 }
 
-fn token_row(label: &str, value: &str, color: Rgba) -> AnyElement {
-    let text_pri = palette::text_primary();
-    let text_sec = palette::text_secondary();
-    let l = SharedString::from(label);
-    let v = SharedString::from(value);
-    h_flex().gap_3().items_center()
-        .child(div().w(px(16.0)).h(px(16.0)).rounded_md().bg(color).border_1()
-            .border_color(if color.r > 0.9 && color.g > 0.9 && color.b > 0.9 { palette::border_light() } else { gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } }))
-        .child(div().child(l).text_color(text_sec).text_sm().font_family(font_stack()).flex_1())
-        .child(div().child(v).text_color(text_pri).text_sm().font_family(mono_font()))
-        .into_any_element()
+fn skill_select(text: &str, active: bool, _bg: Rgba) -> impl IntoElement {
+    let t = SharedString::from(text);
+    let bg = if active { palette::accent_dim() } else { gpui::Rgba { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } };
+    let tc = if active { palette::accent() } else { palette::text_secondary() };
+    div().px_3().py(px(8.0)).rounded_md().bg(bg)
+        .hover(|s| s.bg(if active { palette::accent_dim() } else { palette::bg_elevated() }))
+        .cursor_pointer()
+        .child(div().child(t).text_color(tc).text_sm().font_family(font_stack()))
 }
 
-fn mono_font() -> SharedString {
-    SharedString::from("'SF Mono', 'Fira Code', 'Cascadia Code', monospace")
-}
-
-fn export_btn(label: &str, accent: Rgba) -> AnyElement {
-    let text_pri = palette::text_primary();
+fn export_btn(label: &str, _accent: Rgba) -> AnyElement {
     let l = SharedString::from(label);
     h_flex().px_3().py(px(8.0)).rounded_lg().bg(palette::bg_card())
         .hover(|s| s.bg(palette::bg_elevated())).cursor_pointer()
-        .gap_2().items_center()
-        .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(accent))
-        .child(div().child(l).text_color(text_pri).text_sm().font_family(font_stack()))
+        .child(div().child(l).text_color(palette::text_primary()).text_sm().font_family(font_stack()))
         .into_any_element()
 }
 
 fn history_item(label: &str, time: &str, dot: Rgba) -> AnyElement {
-    let text_pri = palette::text_primary();
-    let text_sec = palette::text_secondary();
     let l = SharedString::from(label);
     let t = SharedString::from(time);
     h_flex().px_3().py(px(6.0)).rounded_md()
-        .hover(|s| s.bg(palette::bg_card())).cursor_pointer()
-        .gap_2().items_center()
+        .hover(|s| s.bg(palette::bg_card())).cursor_pointer().gap_2().items_center()
         .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(dot))
-        .child(div().child(l).text_color(text_pri).text_sm().font_family(font_stack()).flex_1())
-        .child(div().child(t).text_color(text_sec).text_xs().font_family(font_stack()))
+        .child(div().child(l).text_color(palette::text_primary()).text_sm().font_family(font_stack()).flex_1())
+        .child(div().child(t).text_color(palette::text_secondary()).text_xs().font_family(font_stack()))
         .into_any_element()
 }
 

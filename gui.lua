@@ -1,5 +1,4 @@
 -- LuaJIT FFI binding for libmy_design_gui.so
--- Provides a Lua-facing GUI object backed by gpui.
 
 local ffi = require("ffi")
 local json = require("json")
@@ -21,25 +20,21 @@ ffi.cdef[[
     void gui_stream_delta(void* app, const char* session_id, const char* delta);
     void gui_append_message(void* app, const char* session_id, const char* role, const char* text);
 
-    void gui_append_design(void* app, const char* session_id, const char* html, const char* description);
+    void gui_set_pages(void* app, const char* pages_json);
+    void gui_set_page_done(void* app, int index);
 ]]
 
 local lib = ffi.load("my_design_gui", true)
 
 local M = {}
-
--- Holds references to prevent LuaJIT from GCing callbacks.
 M._apps = {}
 
--- C-compatible callback for user messages.
 local function make_user_callback(lua_handler)
     return ffi.cast("void (*)(const char*, const char*, void*)", function(session_id, text, userdata)
         local s = ffi.string(session_id)
         local t = ffi.string(text)
         local ok, err = pcall(lua_handler, s, t)
-        if not ok then
-            log.error("[GUI] user message handler error: %s", err)
-        end
+        if not ok then log.error("[GUI] handler error: %s", err) end
     end)
 end
 
@@ -47,14 +42,9 @@ function M.create(config)
     config = config or {}
     local cfg_json = json.encode(config)
     local app = lib.gui_app_create(cfg_json)
-    if app == nil then
-        error("failed to create GUI app")
-    end
+    if app == nil then error("failed to create GUI app") end
     local handle = ffi.cast("void*", app)
-    M._apps[handle] = {
-        handle = handle,
-        user_cb = nil,
-    }
+    M._apps[handle] = { handle = handle, user_cb = nil }
     return handle
 end
 
@@ -80,16 +70,20 @@ function M.run(app)
     return lib.gui_run(app, L)
 end
 
-function M.append_design(app, session_id, html, description)
-    lib.gui_append_design(app, session_id, html, description or "")
-end
-
 function M.stream_delta(app, session_id, delta)
     lib.gui_stream_delta(app, session_id, delta)
 end
 
 function M.append_message(app, session_id, role, text)
     lib.gui_append_message(app, session_id, role, text)
+end
+
+function M.set_pages(app, pages_json)
+    lib.gui_set_pages(app, pages_json)
+end
+
+function M.set_page_done(app, index)
+    lib.gui_set_page_done(app, index)
 end
 
 return M
