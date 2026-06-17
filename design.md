@@ -894,69 +894,133 @@ HTML/CSS 给开发，效果图给客户演示，各取所需。
 
 ## 16. Prompt-First 策略
 
-### 16.1 核心思路
 
-> **先让每页能生成提示词。风格统一是下一步。**
 
-当前最直接的价值链：
+### 16.1 两步走：先出风格参考图，再出页面图
 
-```
-用户一句话需求
-       │
-       ▼
-  AI 拆分为页面列表
-       │
-       ▼
-  用户确认页面
-       │
-       ▼
-  每页生成一个 Imagen Prompt
-  ├── 🛒 商品列表页 → ready
-  ├── 📄 商品详情页 → ready  
-  ├── 🛵 购物车页   → ready
-  └── 💳 结算页     → ready
-       │
-       ▼
-  用户可以直接用这些 prompt 去任何图生图工具出图
-```
 
-### 16.2 为什么先做 Prompt
-
-| 阶段 | 能力 | 价值 |
-|------|------|------|
-| **现在** | 每页生成结构化 prompt | ✅ 设计师可以拿去 Midjourney/Imagen/DALL-E 出图 |
-| 下一步 | 自动批量出图 | ⏳ |
-| 未来 | Style Reference 锁定风格 | 🔮 |
-
-Prompt 本身就是可交付物。设计师拿到 prompt 就能用，不需要等我们接完 API。
-
-### 16.3 Prompt 的质量控制
-
-prompt 由两部分组成，保证下限：
 
 ```
-[Skill Token 前缀] → 由 Design Token 精确填充，不会跑偏
-[页面描述]         → 由 AI 根据页面名 + 用户补充生成
-```
+
+第1步: 风格参考图
+
+  Prompt → "Material 3 design system showcase, buttons, cards,
+
+            inputs, #6750a4 purple, white bg, rounded 16px"
+
+            ↓
+
+  → style_ref.png  ← 定义了整套视觉风格
+
+
+
+第2步: 每页引用风格参考图
+
+  🛒 商品列表页 → prompt + style_ref.png  ← 风格继承
+
+  📄 商品详情页 → prompt + style_ref.png  ← 风格继承
+
+  🛵 购物车页   → prompt + style_ref.png  ← 风格继承
+
+  💳 结算页     → prompt + style_ref.png  ← 风格继承
 
 ```
-"Mobile app UI design, Material Design 3,
- #6750a4 primary, #fffbff background, rounded 16px,
- Google Sans font, high quality ui design
 
----
 
-Page: Shopping Cart
 
-Cart page with product list, quantity stepper,
-price summary, checkout button, coupon input"
+### 16.2 为什么风格参考图是专门的"设计系统展示图"
+
+
+
+不是随便拿第一张页面图当参考，而是专门生成一张包含所有 UI 元素的展示图：
+
+
+
 ```
 
-即使没有任何风格参考图，这个 prompt 出图的质量也是可用的。
+风格参考图内容:
 
----
+  ┌──────────────────────────────┐
 
-## 17. 项目当前状态
+  │  Design System Showcase      │
+
+  │                              │
+
+  │  [Button] [Button] [Button] │
+
+  │  ┌─ Card ─────────────────┐ │
+
+  │  │  title                 │ │
+
+  │  │  description           │ │
+
+  │  └────────────────────────┘ │
+
+  │  Input: [___________]      │
+
+  │  ☑ Checkbox  ☑ Toggle     │
+
+  │  [Tab 1] [Tab 2] [Tab 3]  │
+
+  └──────────────────────────────┘
+
+```
+
+
+
+模型看到这张图就知道：
+
+- 按钮长什么样
+
+- 卡片用什么圆角
+
+- 配色体系是什么
+
+- 字体风格如何
+
+
+
+然后生成每个页面时，所有这些细节都会继承过来。
+
+
+
+### 16.3 模型兼容
+
+
+
+| 模型 | 方式 |
+
+|------|------|
+
+| Google Imagen 3 | styleReference 参数 |
+
+| Midjourney | --sref 参数 |
+
+| Stable Diffusion | IP-Adapter / Reference-Only |
+
+| DALL-E 3 | 不支持参考图，只能用 prompt 文本 |
+
+
+
+### 16.4 当前价值
+
+
+
+即使不接入任何图生图模型，Prompt 本身就是可交付物：
+
+
+
+```
+
+项目需求 → 页面拆分 → 每页生成 Prompt → 设计师拿去任何工具出图
+
+```
+
+
+
+Prompt 由 Skill Token 精确填充，出图质量的下限有保障。
+
+
 
 ### 已实现
 
