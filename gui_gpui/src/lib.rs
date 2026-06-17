@@ -38,7 +38,7 @@ struct PageItem {
     done: bool,
     prompt: String,
     design_preview: String,
-    depth: usize,
+    depth: usize, // 0=page 1=sub-flow 2=sub-sub-flow (max 3 levels)
 }
 
 // ── View state ────────────────────────────────────────────────
@@ -104,7 +104,8 @@ pub extern "C" fn gui_set_pages(app: *mut c_void, pages_json: *const c_char) {
         list.clear();
         for item in items {
             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("Page").to_string();
-            let depth = item.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let raw_depth = item.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let depth = if raw_depth > 2 { 2 } else { raw_depth }; // limit to 3 levels
             list.push(PageItem { name, selected: true, done: false, prompt: String::new(), design_preview: String::new(), depth });
         }
     }
