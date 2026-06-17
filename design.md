@@ -739,3 +739,130 @@ struct PageItem {
 子流程和普通页面的编辑器完全一样：
 - 补充需求 → 生成该页 → 保存返回
 - 不区分"这是主流程还是子流程"，对用户来说每一页都是独立的编辑单元
+
+---
+
+## 15. 最终出图：Google Imagen（每页一个提示词）
+
+### 15.1 为什么用 Imagen 出图
+
+我们目前的代码生成路线能保证：
+- Design Token 精确（颜色/字号/圆角不会偏差）
+- 组件复用（所有卡片风格一致）
+- 可编辑导出（HTML + CSS）
+
+但**视觉效果图**（给客户看的那种）需要更高质量的渲染。Google Imagen 3 的优势：
+
+| 能力 | 我们生成的 HTML | Google Imagen |
+|------|---------------|---------------|
+| 像素级精确 | ✅ | ❌ |
+| 风格统一 | ✅ Design Token | ✅ Style Reference |
+| 视觉质感 | ⚠️ 浏览器渲染 | ✅ 顶级画质 |
+| 一次出所有页 | ❌ 逐页生成 | ✅ Batch API |
+| 光照/阴影/渐变 | ⚠️ CSS 有限 | ✅ 完美 |
+
+### 15.2 每页一个提示词，风格靠 Skill Token 统一
+
+```
+项目: 生鲜电商App (Skill: Material 3)
+  │
+  ├── 商品列表页 → Imagen Prompt 1
+  ├── 商品详情页 → Imagen Prompt 2
+  ├── 购物车页   → Imagen Prompt 3
+  └── 结算页     → Imagen Prompt 4
+
+所有 prompt 前半部分相同（Skill Token 注入）:
+  "Material Design 3 UI, #6750a4 primary, #fffbff background,
+   rounded corners 16px, Google Sans font, clean white surface,
+   soft shadows, ..."
+
+每个 prompt 后半部分不同（页面描述）:
+  "...product listing page with grid of items, price tags,
+    add to cart buttons, filter bar at top"
+```
+
+### 15.3 Prompt 结构设计
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  [Skill 前缀] — 生成设计 Token 关键词，所有页面共用         │
+│                                                             │
+│  "Material Design 3 mobile UI, #6750a4 purple primary,      │
+│   #fffbff white background, #1c1b1f dark text,              │
+│   rounded corners 16px, Google Sans font, clean interface,  │
+│   soft shadows, Material elevation, high quality ui design" │
+│                                                             │
+│  +                                                          │
+│                                                             │
+│  [页面描述] — 每页不同，描述该页的核心功能                    │
+│                                                             │
+│  "e-commerce product listing page with grid layout,         │
+│   product cards with images, prices, ratings, add to cart   │
+│   buttons, top search bar, category filter chips,           │
+│   bottom navigation bar with 5 tabs"                        │
+│                                                             │
+│  =                                                          │
+│                                                             │
+│  [完整 Prompt] → Google Imagen → 高质量 UI 效果图           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 15.4 实现方式
+
+每次生成时，Lua 层调用 `build_imagen_prompt(skill, page_name, page_description)`：
+
+```lua
+function build_imagen_prompt(skill_tokens, page_name, page_desc)
+    -- Skill 前缀（全部用 token 填充）
+    local style_prefix = string.format([[
+        %s UI design, %s primary color, %s background,
+        %s text, border radius %s, %s font,
+        clean modern interface, soft shadows, high quality ui
+    ]], skill_tokens.name, skill_tokens.colors.primary,
+        skill_tokens.colors.background, skill_tokens.colors.text,
+        skill_tokens.radius, skill_tokens.typography.heading)
+
+    -- 拼接页面描述
+    return style_prefix .. "\n\n" .. page_name .. ":\n" .. page_desc
+end
+```
+
+### 15.5 风格一致性保障
+
+第一张图生成后，将其作为 **Style Reference** 传给后续请求：
+
+```
+第1页: prompt + style_ref = null     → 生成 商品列表图
+第2页: prompt + style_ref = 第1张图  → 生成 商品详情图（风格继承）
+第3页: prompt + style_ref = 第1张图  → 生成 购物车图（风格继承）
+...
+```
+
+Google Vertex AI 的 `styleReference` 参数就是干这个的。不需要 LoRA，不需要 ControlNet，一次 API 调用级别的风格锁定。
+
+### 15.6 工作流整合
+
+```
+用户确认页面列表
+       │
+       ▼
+选择 Skill → 设置 Design Token
+       │
+       ▼
+生成 HTML/CSS（精确设计稿，可编辑）
+       │
+       ▼
+生成 Imagen Prompt（每页一个）
+       │
+       ▼
+调用 Google Imagen API
+  ├─ 第1页: prompt + 无 reference → 出图
+  ├─ 第2页: prompt + ref=第1张   → 出图（风格一致）
+  ├─ 第3页: prompt + ref=第1张   → 出图（风格一致）
+  └─ ...
+       │
+       ▼
+返回所有页面效果图
+```
+
+HTML/CSS 给开发，效果图给客户演示，各取所需。
