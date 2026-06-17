@@ -2,6 +2,10 @@
 
 > 基于 AI 的 UI 设计系统，集成主流 App 与网站 UI 设计方案，助力快速生成高质量界面。
 
+**相关文档：**
+- [📐 设计方案 → `design.md`](./design.md) — 架构设计、技术选型、数据流、关键决策
+- [🎨 Skill 设计风格指南 → `skills/SKILLS.md`](./skills/SKILLS.md) — 各 Skill 的详细介绍和选择指南
+
 ---
 
 ## 项目概述
@@ -27,14 +31,32 @@
        └────── 3 层桥接 ──┴──── C ABI / FFI ────┘
 ```
 
-### 分层说明
+详见 [`design.md`](./design.md) 第 1-3 节。
 
-| 层 | 语言 | 职责 |
-|----|------|------|
-| **入口层** | C | 加载 .so、初始化 LuaJIT、调用 run_gui() |
-| **业务逻辑层** | LuaJIT | Skill 管理、LLM 调用、协程调度、测试脚本 |
-| **桥接层** | C + LuaJIT FFI | `opencode.*` 全局函数注册、gui_tick 定时器回呼 |
-| **渲染层** | Rust (gpui) | GPU 加速窗口渲染、三栏布局、鼠标/键盘事件 |
+---
+
+## 快速开始
+
+```bash
+# 1. 编译 Rust GUI
+make gui
+
+# 2. 编译 C 入口 + Lua 引擎
+make
+
+# 3. 运行（需要桌面环境 X11/Wayland）
+./my_design
+```
+
+### 环境变量
+
+| 变量 | 用途 |
+|------|------|
+| `MY_DESIGN_GUI_TEST_SCRIPT` | GUI 自动化测试脚本路径 |
+| `MY_DESIGN_GUI_TEST_MSG` | 启动后自动发送的测试消息 |
+| `OPENAI_API_KEY` | OpenAI API 密钥 |
+| `OPENAI_BASE_URL` | API 地址（默认 `https://api.openai.com/v1`） |
+| `OPENAI_MODEL` | 模型名（默认 `gpt-4o-mini`） |
 
 ---
 
@@ -50,11 +72,11 @@ my_design/
 │       └── components/     # 设计组件（预留）
 ├── skills/                # 设计 Skill 定义
 │   ├── SKILLS.md          # Skill 使用指南
-│   ├── web_landing.lua    # Web 着陆页
 │   ├── material_you.lua   # Material Design 3
 │   ├── ios_hig.lua        # iOS HIG
 │   ├── ant_design.lua     # Ant Design 企业后台
-│   └── shadcn.lua         # Shadcn/ui 现代 Web
+│   ├── shadcn.lua         # Shadcn/ui 现代 Web
+│   └── web_landing.lua    # Web 着陆页
 ├── main.lua               # 主入口：GUI 模式 + LLM 协程
 ├── gui.lua                # LuaJIT FFI 绑定（精简版）
 ├── json.lua               # JSON 工具（cjson 封装）
@@ -63,8 +85,8 @@ my_design/
 ├── gui_tick.c / .h        # 定时器 / 协程调度
 ├── main.c                 # C 入口
 ├── Makefile               # 编译脚本
-├── libmy_design_gui.so    # Rust 编译产物（35MB）
-└── my_design              # 最终二进制（47KB）
+├── design.md              # 架构设计文档 ←
+└── README.md              # 本文件
 ```
 
 ---
@@ -107,54 +129,40 @@ my_design/
 
 ## Skill 机制
 
-每个 Skill 是一组设计模式定义：
+每个 Skill 是一组设计模式定义，包含 **Design Token + 组件图谱 + 布局模板 + Prompt 模板**。
 
-| 组成部分 | 说明 |
-|---------|------|
-| **Design Token** | 配色、间距、字体、圆角等设计变量 |
-| **组件图谱** | 该场景下的典型 UI 组件组合 |
-| **布局模板** | 页面结构的最佳实践 |
-| **Prompt 模板** | 传递给 AI 的增强提示词 |
-
-### 内置 Skills
+内置 5 个 Skill，覆盖主流设计体系：
 
 | Skill | 风格 | 适用场景 |
 |-------|------|---------|
-| **iOS HIG** | Apple 原生 iOS | iPhone/iPad App |
-| **Material Design 3** | Google Material You | Android / 跨平台移动端 |
-| **Shadcn/ui** | 现代简约 Web | SaaS / Landing Page |
-| **Ant Design** | 企业级中后台 | Dashboard / 数据管理 |
-| **Web Landing** | 营销着陆页 | 产品官网 / 品牌展示 |
+| [**iOS HIG**](./skills/ios_hig.lua) | Apple 原生 iOS | iPhone/iPad App |
+| [**Material Design 3**](./skills/material_you.lua) | Google Material You | Android / 跨平台移动端 |
+| [**Shadcn/ui**](./skills/shadcn.lua) | 现代简约 Web | SaaS / Landing Page |
+| [**Ant Design**](./skills/ant_design.lua) | 企业级中后台 | Dashboard / 数据管理 |
+| [**Web Landing**](./skills/web_landing.lua) | 营销着陆页 | 产品官网 / 品牌展示 |
 
-详见 [`skills/SKILLS.md`](./skills/SKILLS.md)。
+详细说明见 [`skills/SKILLS.md`](./skills/SKILLS.md)。
 
 ---
 
-## 快速开始
+## 设计稿生成流程
 
-```bash
-# 1. 编译 Rust GUI
-make gui
-
-# 2. 编译 C 入口 + Lua 引擎
-make
-
-# 3. 运行（需要桌面环境 X11/Wayland）
-./my_design
-
-# 自动化测试
-MY_DESIGN_GUI_TEST_SCRIPT=./test.lua ./my_design
+```
+用户在输入框打字 → 点击 Generate
+       │
+       ▼
+Lua 协程启动:
+  ├─ ① build_prompt() → 填充 Design Token 生成 prompt
+  ├─ ② opencode.http_post() → 调用 LLM API
+  ├─ ③ 解析 AI 返回的设计内容
+  ├─ ④ gui.stream_delta() → 流式输出到画布
+  └─ ⑤ gui.append_message("design") → 展示设计预览卡片
+       │
+       ▼
+画布上显示设计描述 + 预览卡片
 ```
 
-### 环境变量
-
-| 变量 | 用途 |
-|------|------|
-| `MY_DESIGN_GUI_TEST_SCRIPT` | GUI 自动化测试脚本路径 |
-| `MY_DESIGN_GUI_TEST_MSG` | 启动后自动发送的测试消息 |
-| `OPENAI_API_KEY` | OpenAI API 密钥 |
-| `OPENAI_BASE_URL` | API 地址（默认 `https://api.openai.com/v1`） |
-| `OPENAI_MODEL` | 模型名（默认 `gpt-4o-mini`） |
+详见 [`design.md`](./design.md) 第 10 节。
 
 ---
 
@@ -169,6 +177,8 @@ MY_DESIGN_GUI_TEST_SCRIPT=./test.lua ./my_design
 | AI API | OpenAI-compatible (HTTP POST) |
 | 构建 | Makefile + Cargo |
 | 二进制入口 | C (47KB) + Rust .so (35MB) |
+
+选型理由见 [`design.md`](./design.md) 第 2 节。
 
 ---
 
