@@ -1,0 +1,20 @@
+[package]
+name = "my_design_gui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "my_design_gui"
+crate-type = ["cdylib"]
+
+[dependencies]
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+syntect = "5.2"
+image = "0.25"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
